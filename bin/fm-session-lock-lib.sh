@@ -88,6 +88,30 @@ fm_harness_process_matches() {  # <comm> <args>
   return 1
 }
 
+# Windows/Cygwin last resort. Some Git-for-Windows Cygwin `ps` builds reject
+# -o outright (`ps: unknown option -- o`), and even where -o works, Cygwin
+# cannot report a real parent pid once the chain crosses out of the Cygwin
+# process tree into Claude Code's native Windows launcher (claude.exe) - the
+# ordinary ancestry walk below finds nothing on that platform even though a
+# real session is running. Claude Code sets CLAUDE_PID to that launcher's own
+# Windows process id; cross-check it against `ps -W`'s native-process listing
+# (never trust the env var blindly) before treating it as this session's
+# harness. Returns the Cygwin-space pid `ps -W` reports for that row, which -
+# unlike the raw Windows pid - can be re-queried later by `ps -W -p` for
+# liveness (see fm_harness_pid_alive). A safe no-op wherever -W is not a real
+# flag: the command errors, the row is empty, and the function just fails.
+fm_harness_native_claude_pid() {  # <winpid>
+  local winpid=$1 row cpid comm
+  case "$winpid" in ''|*[!0-9]*) return 1 ;; esac
+  row=$(ps -W 2>/dev/null | awk -v w="$winpid" '$4==w{$1=$1; print}') || return 1
+  [ -n "$row" ] || return 1
+  cpid=$(printf '%s\n' "$row" | awk '{print $1}')
+  comm=$(printf '%s\n' "$row" | cut -d' ' -f8-)
+  fm_harness_process_matches "$comm" "$comm" || return 1
+  [ "$FM_HARNESS_IS_CLAUDE" -eq 1 ] || return 1
+  printf '%s\n' "$cpid"
+}
+
 # Walk the current process ancestry (up to 16 hops) and print this session's
 # contiguous verified-harness ancestry, innermost pid first.
 #
@@ -122,6 +146,9 @@ fm_harness_ancestry_pids() {
     pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
     [ -n "$pid" ] && [ "$pid" -gt 1 ] || break
   done
+  if [ "$printed" -eq 0 ] && [ -n "${CLAUDE_PID:-}" ]; then
+    pid=$(fm_harness_native_claude_pid "$CLAUDE_PID") && { printf '%s\n' "$pid"; printed=1; }
+  fi
   [ "$printed" -eq 1 ]
 }
 
@@ -144,12 +171,24 @@ EOF
 }
 
 # True if $1 is a live process that looks like a verified harness.
-fm_harness_pid_alive() {
-  local pid=$1 comm args
-  kill -0 "$pid" 2>/dev/null || return 1
-  comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
-  args=$(ps -o args= -p "$pid" 2>/dev/null)
-  fm_harness_process_matches "$comm" "$args"
+#
+# The Windows/Cygwin fallback below covers a pid recorded through
+# fm_harness_native_claude_pid: kill(2) cannot signal a native Windows process
+# from inside the Cygwin/MSYS pid table, but `ps -W -p` can still re-find it by
+# the same Cygwin-space pid that function returned. A no-op elsewhere: kill -0
+# already decided a real pid, and -W errors harmlessly on a ps build that lacks it.
+fm_harness_pid_alive() {  # <pid>
+  local pid=$1 comm args row
+  if kill -0 "$pid" 2>/dev/null; then
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
+    args=$(ps -o args= -p "$pid" 2>/dev/null)
+    fm_harness_process_matches "$comm" "$args"
+    return
+  fi
+  row=$(ps -W -p "$pid" 2>/dev/null | awk -v p="$pid" '$1==p{$1=$1; print}') || return 1
+  [ -n "$row" ] || return 1
+  comm=$(printf '%s\n' "$row" | cut -d' ' -f8-)
+  fm_harness_process_matches "$comm" "$comm"
 }
 
 # True when state dir $1 holds a session lock whose pid is ANY harness ancestor

@@ -3034,6 +3034,67 @@ spawn_record_traceparent() {
   return "$status"
 }
 
+# Windows herdr: the pane's OS-default shell is native cmd.exe, not a POSIX
+# shell - verified live, cmd.exe rejects `export` and `env` outright ("not
+# recognized"), so every command from here on (this GOTMPDIR export, and the
+# launch command's own `$(...)` substitution) would silently never run. Launch
+# an interactive bash inside that same pane first, the same nested-shell
+# mechanism `treehouse get` itself already relies on, and confirm it is
+# actually ready before proceeding rather than assuming a fixed sleep landed.
+#
+# Verified pitfall: sending the bare word `bash` is NOT safe on a machine with
+# WSL installed. cmd.exe there resolves `bash` to Windows' own
+# C:\Windows\System32\bash.exe stub, which launches the DEFAULT WSL DISTRO -
+# an entirely different Linux filesystem/PATH (its own `/mnt/c/...` mounts,
+# no `claude` on its PATH, none of this worktree's `/c/...`-style paths
+# resolvable) - never Git-Bash, regardless of what this very script is running
+# under. Confirmed live: the launch command below failed inside a real Ubuntu
+# WSL prompt this way even though this script itself runs under Git-Bash the
+# whole time. Resolve THIS interpreter's own absolute Windows path (via
+# cygpath, since $BASH is a Git-Bash POSIX path) and send that exact path
+# instead, so the nested shell is deterministically the same Git-Bash this
+# script depends on everywhere else, never whatever `bash` happens to resolve
+# to in the pane's own possibly-different PATH ordering.
+# The readiness probe echoes $BASH_VERSION unescaped INSIDE the pane (never
+# expanded by this script's own shell, since the string is single-quoted
+# here): bash expands it to a version string starting with a digit, while
+# cmd.exe does not perform $-expansion at all and echoes the literal text
+# back, so a leading digit after the marker is proof positive of a real bash
+# prompt rather than of any specific command being merely found on PATH -
+# though it does NOT by itself distinguish Git-Bash from WSL bash, which is
+# exactly why the explicit resolved path above is the real fix and this probe
+# is only a startup-readiness gate, not a shell-identity gate.
+case "$BACKEND-$(uname -s 2>/dev/null)" in
+  herdr-MINGW*|herdr-MSYS*|herdr-CYGWIN*)
+    fm_spawn_herdr_bash_exe=$(cygpath -w "${BASH:-/usr/bin/bash}" 2>/dev/null) || fm_spawn_herdr_bash_exe=""
+    if [ -z "$fm_spawn_herdr_bash_exe" ]; then
+      echo "error: could not resolve this script's own bash interpreter to a Windows path for window $T; refusing to guess which 'bash' the pane's PATH would launch (WSL, if installed, silently intercepts the bare word)" >&2
+      exit 1
+    fi
+    # --login: verified live that launching the bare .exe with no flags starts
+    # bash as an interactive NON-login shell, which never sources /etc/profile
+    # - the script that prepends Git-Bash's own /usr/bin, /mingw64/bin, etc.
+    # onto PATH. Without it the shell looks fully alive (even runs .bashrc's
+    # prompt customization) while lacking `env` and everything else Git-Bash
+    # normally provides, which is exactly the failure the launch command below
+    # would hit next. --login fixes PATH completely (verified live).
+    spawn_send_text_line "$T" "\"$fm_spawn_herdr_bash_exe\" --login"
+    sleep 0.5
+    spawn_send_text_line "$T" 'echo FM_HERDR_BASH_READY=$BASH_VERSION'
+    fm_spawn_bash_ready=0
+    for _ in $(seq 1 30); do
+      if fm_backend_capture "$BACKEND" "$T" 40 2>/dev/null | grep -qE 'FM_HERDR_BASH_READY=[0-9]'; then
+        fm_spawn_bash_ready=1
+        break
+      fi
+      sleep 0.5
+    done
+    if [ "$fm_spawn_bash_ready" -ne 1 ]; then
+      echo "error: window $T did not confirm an interactive bash shell within 15s after entering its worktree; refusing to send POSIX launch commands into what may still be a cmd.exe pane" >&2
+      exit 1
+    fi
+    ;;
+esac
 # Export GOTMPDIR into the crewmate's pane shell so the agent and every child
 # process (go build, go test, ...) inherit it. Sent before the launch command so
 # the env is set when the agent starts; the brief sleep lets the export land.

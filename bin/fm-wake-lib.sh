@@ -337,6 +337,71 @@ fm_lock_owner_dir() {
   mktemp -d "${lock_abs}.owner.XXXXXX" 2>/dev/null
 }
 
+# Whether `ln -s` on this platform genuinely creates a symlink for a directory
+# target. Some Git-for-Windows Cygwin/MSYS `ln` builds report success (exit 0)
+# without SeCreateSymbolicLinkPrivilege but silently perform a one-time
+# recursive copy instead of linking: `[ -L ]`/`readlink` never recognize the
+# result, and content added to the source afterward never appears through it.
+# fm_lock_try_create's ownerdir+symlink claim then always "fails" its own
+# fm_lock_points_to_owner check while leaving the copy behind uncleaned, so
+# every acquire on such a platform falls through to the slow steal/staleness
+# path instead of ever truly claiming the lock. Probed once per process
+# (each probe pays a real mkdir+ln+rmdir cost) and cached.
+FM_LOCK_SYMLINKS_WORK=
+fm_lock_symlinks_work() {
+  if [ -z "$FM_LOCK_SYMLINKS_WORK" ]; then
+    local probe_dir probe_link
+    probe_dir=$(mktemp -d "$STATE/.lock-symlink-probe.XXXXXX" 2>/dev/null) || { FM_LOCK_SYMLINKS_WORK=0; return 1; }
+    probe_link="${probe_dir}.link"
+    rm -rf "$probe_link" 2>/dev/null
+    if ln -s "$probe_dir" "$probe_link" 2>/dev/null && [ -L "$probe_link" ]; then
+      FM_LOCK_SYMLINKS_WORK=1
+    else
+      FM_LOCK_SYMLINKS_WORK=0
+    fi
+    # rm -rf, not rm -f: when the probe just proved ln -s produces a real
+    # directory copy instead of a symlink, plain `rm -f` cannot remove it and
+    # leaves it behind - the accumulating .lock-symlink-probe.*.link debris
+    # this repo's own state showed after repeated runs.
+    rm -rf "$probe_link" 2>/dev/null
+    rmdir "$probe_dir" 2>/dev/null
+  fi
+  [ "$FM_LOCK_SYMLINKS_WORK" = 1 ]
+}
+
+# Fallback claim for fm_lock_try_create on a platform where
+# fm_lock_symlinks_work is false. Skips the ownerdir+symlink indirection
+# entirely and claims $lockdir with one atomic `mkdir`, which - unlike this
+# platform's `ln -s` - genuinely is an atomic, exclusive create at the
+# filesystem level; metadata is written directly inside $lockdir. This is not
+# a new lock shape: fm_lock_release and fm_lock_recheck_stale_owner already
+# treat a plain (non-symlink) lockdir with its own pid file as a valid, fully
+# supported representation, so every other lock function keeps working
+# unmodified once this claims that shape.
+fm_lock_try_create_mkdir() {  # <lockdir> [<allowed_steal_owner>]
+  local lockdir=$1 allowed_steal_owner=${2:-} mypid back
+  mkdir "$lockdir" 2>/dev/null || return 1
+  mypid=${BASHPID:-$$}
+  if ! { printf '%s\n' "$mypid" > "$lockdir/pid"; } 2>/dev/null; then
+    fm_lock_clean_known_files "$lockdir"
+    rmdir "$lockdir" 2>/dev/null || true
+    return 1
+  fi
+  back=$(cat "$lockdir/pid" 2>/dev/null || true)
+  if [ "$back" != "$mypid" ]; then
+    fm_lock_clean_known_files "$lockdir"
+    rmdir "$lockdir" 2>/dev/null || true
+    return 1
+  fi
+  if fm_lock_claim_blocked_by_steal "$lockdir" "$allowed_steal_owner"; then
+    fm_lock_clean_known_files "$lockdir"
+    rmdir "$lockdir" 2>/dev/null || true
+    return 1
+  fi
+  FM_LOCK_OWNER_DIR=$lockdir
+  return 0
+}
+
 fm_lock_prepare_owner() {
   local ownerdir=$1 mypid back
   mypid=${BASHPID:-$$}
@@ -415,6 +480,13 @@ fm_lock_claim() {
 fm_lock_try_create() {
   local lockdir=$1 allowed_steal_owner=${2:-} ownerdir
   FM_LOCK_OWNER_DIR=
+  if [ -e "$lockdir" ] || [ -L "$lockdir" ]; then
+    return 1
+  fi
+  if ! fm_lock_symlinks_work; then
+    fm_lock_try_create_mkdir "$lockdir" "$allowed_steal_owner"
+    return
+  fi
   ownerdir=$(fm_lock_owner_dir "$lockdir") || return 1
   if [ -e "$lockdir" ] || [ -L "$lockdir" ]; then
     fm_lock_discard_owner "$ownerdir"
@@ -447,8 +519,15 @@ fm_lock_remove_path() {
     [ -n "$ownerdir" ] && fm_lock_discard_owner "$ownerdir"
     return 0
   fi
-  fm_lock_clean_known_files "$lockdir"
-  rmdir "$lockdir" 2>/dev/null
+  # rm -rf, not fm_lock_clean_known_files + rmdir: on a platform where
+  # fm_lock_symlinks_work is false, a stale lockdir can be a broken `ln -s`
+  # target that Git-for-Windows Cygwin/MSYS silently turned into a real
+  # directory copy (see fm_lock_symlinks_work) instead of the plain
+  # known-files shape this repo writes itself. rmdir only removes an empty
+  # directory, so any such leftover content left it permanently unremovable -
+  # every caller here already verified staleness/self-ownership before
+  # calling, so a full recursive removal is safe and required to reclaim it.
+  rm -rf "$lockdir" 2>/dev/null
 }
 
 fm_lock_mid_acquire_is_fresh() {

@@ -701,6 +701,16 @@ fm_backend_herdr_canonical_socket_path() {  # <socket-path>
   [ -n "$socket" ] || return 1
   case "$socket" in
     /*) ;;
+    [A-Za-z]:\\*|[A-Za-z]:/*)
+      # Windows herdr reports a native drive-letter path (e.g.
+      # C:\Users\...\herdr.sock) for both HERDR_SOCKET_PATH and this JSON
+      # socket_path; convert to the POSIX form the dirname/basename/cd
+      # canonicalization below already expects, so the two spellings this
+      # function exists to compare still resolve to the same string.
+      command -v cygpath >/dev/null 2>&1 || return 1
+      socket=$(cygpath -u "$socket" 2>/dev/null) || return 1
+      case "$socket" in /*) ;; *) return 1 ;; esac
+      ;;
     *) return 1 ;;
   esac
   sock_dir=$(dirname "$socket")
@@ -2524,10 +2534,47 @@ fm_backend_herdr_target_ready() {  # <target>
 # `.result.pane.foreground_cwd` tracks the ACTUALLY RUNNING foreground
 # process's cwd instead, which is what changes when `treehouse get` enters its
 # worktree subshell - confirmed live against a real treehouse acquisition.
+# Windows herdr builds verified NOT to report foreground_cwd at all (the field
+# is entirely absent from `pane get`, not merely stale) - `pane get`'s `cwd`
+# stays frozen at pane-creation time exactly as the pitfall above describes,
+# and there is no live per-process cwd query on this platform. treehouse get
+# still genuinely succeeds and enters its worktree there (verified: the pane's
+# own text shows "Entered worktree at <path>. Type 'exit' to return." right
+# after acquisition); this reads that banner back from the pane's own scrollback
+# as the only available proof of the worktree path. --source recent-unwrapped
+# (not fm_backend_herdr_capture's default recent) avoids a long path splitting
+# across the wrapped terminal width and breaking the single-line match below.
+# The Windows-native path treehouse prints (drive letter or ~-relative,
+# backslash-separated) is converted through cygpath so the caller's
+# comparisons against PROJ_ABS_REAL, which run in POSIX-path space, still
+# apply unmodified.
+fm_backend_herdr_current_path_worktree_banner_fallback() {  # <target>
+  local out line path
+  out=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane read "$FM_BACKEND_HERDR_PANE" --source recent-unwrapped --lines 200 2>/dev/null) || return 0
+  line=$(printf '%s\n' "$out" | grep -o "Entered worktree at .*\. Type 'exit' to return\." | tail -n 1) || return 0
+  [ -n "$line" ] || return 0
+  path=${line#*Entered worktree at }
+  path=${path%%. Type*}
+  [ -n "$path" ] || return 0
+  case "$path" in
+    '~'*) path="${USERPROFILE:-}${path#\~}" ;;
+  esac
+  case "$path" in
+    [A-Za-z]:\\*|[A-Za-z]:/*)
+      command -v cygpath >/dev/null 2>&1 || return 0
+      path=$(cygpath -u "$path" 2>/dev/null) || return 0
+      ;;
+  esac
+  printf '%s' "$path"
+}
+
 fm_backend_herdr_current_path() {  # <target>
+  local cwd
   fm_backend_herdr_target_ready "$1" || return 0
-  fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane get "$FM_BACKEND_HERDR_PANE" 2>/dev/null \
-    | jq -r '.result.pane.foreground_cwd // empty' 2>/dev/null
+  cwd=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane get "$FM_BACKEND_HERDR_PANE" 2>/dev/null \
+    | jq -r '.result.pane.foreground_cwd // empty' 2>/dev/null)
+  [ -n "$cwd" ] || cwd=$(fm_backend_herdr_current_path_worktree_banner_fallback "$1")
+  printf '%s' "$cwd"
 }
 
 # fm_backend_herdr_send_text_line: send one line of TEXT then submit,
