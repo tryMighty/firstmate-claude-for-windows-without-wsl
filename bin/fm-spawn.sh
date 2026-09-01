@@ -2246,6 +2246,28 @@ EOF
       exit 1
     fi
     T="$HERDR_SES:$HERDR_PANE_ID"
+    # Register this pane with herdr's own agent tracking BEFORE anything is
+    # typed into it (treehouse get, the launch command, ...). Verified live:
+    # herdr's own passive content detector eventually notices a running
+    # claude on its own (agent_session.source becomes "herdr:claude") but
+    # never promotes that past agent_status=unknown or into the top-level
+    # `agent` field - so the pane is genuinely running claude yet absent from
+    # `herdr agent list` and any UI built on it. An external `pane
+    # report-agent-session`/`report-agent` call succeeds and shows up
+    # correctly ONLY when it wins the race against that passive detector -
+    # verified both ways live: called after the detector had already claimed
+    # the pane (source=herdr:claude already set), it was accepted (exit 0)
+    # but silently had no visible effect; called here, before the detector
+    # has anything to look at, it takes hold immediately. Scoped to claude
+    # only, not secondmate or relaunch (a relaunch's pane is already
+    # whatever the prior incarnation left it as).
+    if [ "$HARNESS" = claude ] && [ "$KIND" != secondmate ] && [ "$RELAUNCH" -eq 0 ]; then
+      fm_backend_herdr_cli "$HERDR_SES" pane report-agent-session "$HERDR_PANE_ID" --source firstmate --agent claude >/dev/null 2>&1 \
+        && fm_backend_herdr_cli "$HERDR_SES" pane report-agent "$HERDR_PANE_ID" --source firstmate --agent claude --state working >/dev/null 2>&1
+      # Best-effort: visibility in herdr's own agent tracking, not a
+      # correctness requirement for the spawn itself - never fail the spawn
+      # over it either way.
+    fi
     ;;
   zellij)
     ZELLIJ_SES=$(fm_backend_zellij_container_ensure) || exit 1
