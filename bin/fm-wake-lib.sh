@@ -422,8 +422,22 @@ fm_lock_link_owner() {
 
 fm_lock_points_to_owner() {
   local lockdir=$1 ownerdir=$2 actual
-  actual=$(readlink "$lockdir" 2>/dev/null) || return 1
-  [ "$actual" = "$ownerdir" ]
+  if [ -L "$lockdir" ]; then
+    actual=$(readlink "$lockdir" 2>/dev/null) || return 1
+    [ "$actual" = "$ownerdir" ]
+    return
+  fi
+  # Verified live: on a platform where fm_lock_symlinks_work is false, every
+  # caller here (fm_lock_try_create_mkdir, fm_lock_claim_blocked_by_steal,
+  # fm_lock_recheck_stale_owner, and the steal-reclaim check in
+  # fm_lock_try_acquire) passes a plain mkdir'd claim as BOTH lockdir and
+  # ownerdir - fm_lock_try_create_mkdir sets FM_LOCK_OWNER_DIR=$lockdir
+  # itself, since that shape has no separate symlink target to indirect
+  # through. Without this branch every one of those callers' ownership
+  # check always failed (readlink on a real directory returns nothing), so
+  # a stale claim could never be verified as reclaimable and the steal
+  # loop wedged permanently instead of ever completing.
+  [ "$lockdir" = "$ownerdir" ] && [ -d "$lockdir" ] && [ ! -L "$lockdir" ]
 }
 
 fm_lock_discard_owner() {
